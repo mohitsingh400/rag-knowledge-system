@@ -1,9 +1,11 @@
 import streamlit as st
-import chromadb
 import requests
 import uuid
+import numpy as np
+import faiss
 from dotenv import load_dotenv
 import os
+from sentence_transformers import SentenceTransformer
 
 # ===============================
 # Load environment variables
@@ -12,42 +14,47 @@ load_dotenv()
 
 # =====================================================
 # 🔑 PASTE YOUR GROQ API KEY HERE (get from console.groq.com)
-# Option 1: Direct paste (for testing only, not recommended for production)
+# Option 1: Direct paste (for testing only)
 # GROQ_API_KEY = "your_groq_api_key_here"
 #
 # Option 2: Use .env file (recommended)
-# Create a .env file in same folder and add: GROQ_API_KEY=your_key_here
+# Create a .env file and add: GROQ_API_KEY=your_key_here
+#
+# Option 3: Streamlit Cloud → App Settings → Secrets
+# Add: GROQ_API_KEY = 'your_key_here'
 # =====================================================
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # reads from .env file
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # reads from .env or Streamlit secrets
 
 
 # ===============================
-# Initialize ChromaDB client
+# Initialize FAISS + Embedding Model
 # ===============================
 @st.cache_resource
-def init_chroma():
-    client = chromadb.Client()
-    collection = client.get_or_create_collection(
-        name="knowledge_base",
-        metadata={"hnsw:space": "cosine"}
-    )
-    return collection
+def init_faiss():
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    dimension = 384  # all-MiniLM-L6-v2 output size
+    index = faiss.IndexFlatL2(dimension)
+    return model, index
+
+# In-memory document store
+if "documents" not in st.session_state:
+    st.session_state.documents = []  # list of {"id": ..., "text": ..., "title": ...}
 
 
 # ===============================
-# Groq API Call (replaces SkillCaptain)
+# Groq API Call
 # ===============================
 def call_groq_api(prompt):
     """Call the Groq API with the given prompt"""
     url = "https://api.groq.com/openai/v1/chat/completions"
 
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",  # API key goes here
+        "Authorization": f"Bearer {GROQ_API_KEY}",  # 🔑 API key used here
         "Content-Type": "application/json"
     }
 
     body = {
-        "model": "llama-3.3-70b-versatile",  # free model, fast
+        "model": "llama-3.3-70b-versatile",  # free Groq model
         "messages": [
             {"role": "user", "content": prompt}
         ],
@@ -65,30 +72,38 @@ def call_groq_api(prompt):
 
 
 # ===============================
-# Vector DB Functions
+# Vector DB Functions (FAISS)
 # ===============================
-def add_document_to_vector_db(collection, text, metadata=None):
-    """Add a document to the vector database"""
-    doc_id = str(uuid.uuid4())
-    collection.add(
-        documents=[text],
-        metadatas=[metadata or {}],
-        ids=[doc_id]
-    )
+def add_document(model, index, text, title):
+    """Embed and add document to FAISS index"""
+    embedding = model.encode([text]).astype('float32')
+    index.add(embedding)
+    doc_id = str(uuid.uuid4())[:8]
+    st.session_state.documents.append({"id": doc_id, "text": text, "title": title})
     return doc_id
 
-def search_similar_documents(collection, query, n_results=3):
-    """Search for similar documents in the vector database"""
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results
-    )
+def search_documents(model, index, query, n_results=3):
+    """Search similar documents using FAISS"""
+    if index.ntotal == 0:
+        return []
+    query_embedding = model.encode([query]).astype('float32')
+    n_results = min(n_results, index.ntotal)
+    distances, indices = index.search(query_embedding, n_results)
+    results = []
+    for dist, idx in zip(distances[0], indices[0]):
+        if idx < len(st.session_state.documents):
+            doc = st.session_state.documents[idx]
+            results.append({
+                "text": doc["text"],
+                "title": doc["title"],
+                "similarity": round(1 / (1 + dist), 3)
+            })
     return results
 
 def create_rag_prompt(query, context_docs):
-    """Create a RAG prompt combining query and retrieved context"""
-    context = "\n\n".join([doc for doc in context_docs])
-    rag_prompt = f"""Based on the following context information, please answer the question. If the context doesn't contain relevant information, say so clearly.
+    """Create RAG prompt combining query and retrieved context"""
+    context = "\n\n".join([doc["text"] for doc in context_docs])
+    return f"""Based on the following context information, please answer the question. If the context doesn't contain relevant information, say so clearly.
 
 Context:
 {context}
@@ -96,7 +111,6 @@ Context:
 Question: {query}
 
 Answer:"""
-    return rag_prompt
 
 
 # ===============================
@@ -105,8 +119,8 @@ Answer:"""
 st.title("🤖 RAG Demo: Vector DB + LLM")
 st.markdown("### Learn how Retrieval-Augmented Generation works!")
 
-# Initialize ChromaDB
-collection = init_chroma()
+# Initialize FAISS
+model, index = init_faiss()
 
 # Main tabs
 tab1, tab2, tab3, tab4 = st.tabs(["📚 Add Knowledge", "🔍 Search Vector DB", "💬 Ask Questions", "🎓 Compare Responses"])
@@ -125,12 +139,8 @@ with tab1:
     st.subheader("Quick Add: Sample Documents")
     for title, content in sample_docs.items():
         if st.button(f"Add: {title}"):
-            doc_id = add_document_to_vector_db(
-                collection,
-                content,
-                {"title": title, "source": "sample"}
-            )
-            st.success(f"Added '{title}' to knowledge base! ID: {doc_id[:8]}...")
+            doc_id = add_document(model, index, content, title)
+            st.success(f"Added '{title}' to knowledge base! ID: {doc_id}")
 
     st.subheader("Add Custom Document")
     doc_title = st.text_input("Document Title")
@@ -138,12 +148,8 @@ with tab1:
 
     if st.button("Add Custom Document"):
         if doc_content and doc_title:
-            doc_id = add_document_to_vector_db(
-                collection,
-                doc_content,
-                {"title": doc_title, "source": "custom"}
-            )
-            st.success(f"Added '{doc_title}' to knowledge base! ID: {doc_id[:8]}...")
+            doc_id = add_document(model, index, doc_content, doc_title)
+            st.success(f"Added '{doc_title}' to knowledge base! ID: {doc_id}")
         else:
             st.error("Please provide both title and content")
 
@@ -156,19 +162,14 @@ with tab2:
 
     if st.button("Search") and search_query:
         with st.spinner("Searching vector database..."):
-            results = search_similar_documents(collection, search_query, num_results)
+            results = search_documents(model, index, search_query, num_results)
 
-            if results['documents'][0]:
+            if results:
                 st.subheader("Search Results:")
-                for i, (doc, metadata, distance) in enumerate(zip(
-                    results['documents'][0],
-                    results['metadatas'][0],
-                    results['distances'][0]
-                )):
-                    with st.expander(f"Result {i+1} - Similarity: {1-distance:.3f}"):
-                        st.write(f"**Title:** {metadata.get('title', 'Untitled')}")
-                        st.write(f"**Content:** {doc}")
-                        st.write(f"**Distance:** {distance:.3f}")
+                for i, result in enumerate(results):
+                    with st.expander(f"Result {i+1} - Similarity: {result['similarity']}"):
+                        st.write(f"**Title:** {result['title']}")
+                        st.write(f"**Content:** {result['text']}")
             else:
                 st.info("No documents found. Add some documents first!")
 
@@ -184,22 +185,21 @@ with tab3:
         if st.button("Answer with RAG"):
             if user_question:
                 with st.spinner("Retrieving relevant documents..."):
-                    search_results = search_similar_documents(collection, user_question, 2)
+                    results = search_documents(model, index, user_question, 2)
 
-                    if search_results['documents'][0]:
-                        retrieved_docs = search_results['documents'][0]
-                        rag_prompt = create_rag_prompt(user_question, retrieved_docs)
+                    if results:
+                        rag_prompt = create_rag_prompt(user_question, results)
 
                         st.subheader("🔍 Retrieved Context:")
-                        for i, doc in enumerate(retrieved_docs):
-                            st.text_area(f"Document {i+1}", doc, height=100, disabled=True)
+                        for i, doc in enumerate(results):
+                            st.text_area(f"Document {i+1}: {doc['title']}", doc['text'], height=100, disabled=True)
 
                         st.subheader("🤖 RAG Response:")
                         with st.spinner("Getting AI response..."):
-                            response = call_groq_api(rag_prompt)  # ✅ Groq API
+                            response = call_groq_api(rag_prompt)
                             st.write(response)
                     else:
-                        st.warning("No relevant documents found in the knowledge base!")
+                        st.warning("No relevant documents found. Add documents first!")
             else:
                 st.error("Please enter a question")
 
@@ -208,7 +208,7 @@ with tab3:
             if user_question:
                 st.subheader("🤖 Direct LLM Response:")
                 with st.spinner("Getting AI response..."):
-                    response = call_groq_api(user_question)  # ✅ Groq API
+                    response = call_groq_api(user_question)
                     st.write(response)
             else:
                 st.error("Please enter a question")
@@ -226,25 +226,24 @@ with tab4:
             with col1:
                 st.subheader("🔗 RAG Response")
                 with st.spinner("Generating RAG response..."):
-                    search_results = search_similar_documents(collection, comparison_question, 2)
-                    if search_results['documents'][0]:
-                        retrieved_docs = search_results['documents'][0]
-                        rag_prompt = create_rag_prompt(comparison_question, retrieved_docs)
-                        rag_response = call_groq_api(rag_prompt)  # ✅ Groq API
+                    results = search_documents(model, index, comparison_question, 2)
+                    if results:
+                        rag_prompt = create_rag_prompt(comparison_question, results)
+                        rag_response = call_groq_api(rag_prompt)
 
                         st.write("**Context Used:**")
-                        for i, doc in enumerate(retrieved_docs):
-                            st.text_area(f"Context {i+1}", doc[:200] + "...", height=80, disabled=True, key=f"rag_context_{i}")
+                        for i, doc in enumerate(results):
+                            st.text_area(f"Context {i+1}", doc['text'][:200] + "...", height=80, disabled=True, key=f"rag_ctx_{i}")
 
                         st.write("**Response:**")
                         st.write(rag_response)
                     else:
-                        st.warning("No context found for RAG")
+                        st.warning("No context found. Add documents first!")
 
             with col2:
                 st.subheader("🎯 Direct LLM Response")
                 with st.spinner("Generating direct response..."):
-                    direct_response = call_groq_api(comparison_question)  # ✅ Groq API
+                    direct_response = call_groq_api(comparison_question)
                     st.write("**Response:**")
                     st.write(direct_response)
         else:
@@ -253,8 +252,9 @@ with tab4:
 # ===============================
 # Sidebar Info
 # ===============================
-total_docs = collection.count()
-st.sidebar.markdown(f"**Knowledge Base:** {total_docs} documents")
+st.sidebar.markdown(f"**Knowledge Base:** {len(st.session_state.documents)} documents")
+st.sidebar.markdown(f"**FAISS Index:** {index.ntotal} vectors")
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Model:** Llama3-8b (Groq)")
-st.sidebar.markdown("**API:** Groq (Free Tier)")
+st.sidebar.markdown("**Model:** Llama 3.3-70b (Groq)")
+st.sidebar.markdown("**Embeddings:** all-MiniLM-L6-v2")
+st.sidebar.markdown("**Vector DB:** FAISS")
